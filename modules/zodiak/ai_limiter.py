@@ -182,10 +182,12 @@ def _db_set_batch_count(keys_list, today_str, count):
 
 def check_ai_quota(client_id=None):
     """
-    ULTRA-STRICT AI RATE LIMITER:
-    Memeriksa kuota AI harian pengguna (Maksimal persis 2x / hari) via Database MySQL.
-    Menggabungkan Device UUID + Alamat IP + Fingerprint Hash.
-    Anti-Bypass: Tidak bisa diakali walau hapus localStorage, clear cookie, incognito, atau pindah menu.
+    STRICT PER-DEVICE AI RATE LIMITER:
+    Memeriksa kuota AI harian per perangkat (Maksimal persis 2x / hari) via Database MySQL.
+    Menggabungkan Device UUID + Browser Fingerprint (IP + UserAgent).
+    - Berbeda Perangkat di Wi-Fi yang sama (HP vs Laptop): Mendapatkan kuota 2x masing-masing.
+    - Hapus LocalStorage / Cookie / Incognito di perangkat yang sama: Tetap TERBLOKIR.
+    - Pindah Menu (Ramalan -> Kecocokan -> Roasting): Tetap TERBLOKIR.
     """
     try:
         if not client_id:
@@ -193,10 +195,9 @@ def check_ai_quota(client_id=None):
 
         today_str = date.today().isoformat()
 
-        ip_id = get_ip_id()
         fp_id = get_fp_id()
 
-        keys_to_check = [client_id, ip_id, fp_id]
+        keys_to_check = [client_id, fp_id]
         if client_id.startswith('device_'):
             raw = client_id[7:]
             keys_to_check.extend([f"dev_{raw}", f"cookie_{raw}", f"json_{raw}"])
@@ -204,7 +205,7 @@ def check_ai_quota(client_id=None):
         effective_count = _db_get_batch_count(keys_to_check, today_str)
 
         if effective_count >= DAILY_AI_LIMIT:
-            notice = f"Kuota mode AI harian Anda telah habis (Maksimal {DAILY_AI_LIMIT}x per hari). Beralih ke Data Prediksi Statis."
+            notice = f"Kuota mode AI harian Anda telah habis (Maksimal {DAILY_AI_LIMIT}x per hari per perangkat). Beralih ke Data Prediksi Statis."
             return False, effective_count, DAILY_AI_LIMIT, notice
 
         return True, effective_count, DAILY_AI_LIMIT, None
@@ -214,7 +215,7 @@ def check_ai_quota(client_id=None):
 
 def increment_ai_quota(client_id=None):
     """
-    Menambah hitungan penggunaan AI harian pengguna secara ULTRA-STRICT pada Device UUID, IP Address, dan Fingerprint.
+    Menambah hitungan penggunaan AI harian per perangkat pada Device UUID dan Fingerprint (IP + UserAgent).
     """
     try:
         if not client_id:
@@ -225,10 +226,9 @@ def increment_ai_quota(client_id=None):
         is_allowed, current_count, limit, notice = check_ai_quota(client_id)
         new_count = current_count + 1
 
-        ip_id = get_ip_id()
         fp_id = get_fp_id()
 
-        keys_to_update = [client_id, ip_id, fp_id]
+        keys_to_update = [client_id, fp_id]
         if client_id.startswith('device_'):
             raw = client_id[7:]
             keys_to_update.extend([f"dev_{raw}", f"cookie_{raw}", f"json_{raw}"])
@@ -238,6 +238,7 @@ def increment_ai_quota(client_id=None):
         return new_count
     except Exception:
         return 1
+
 
 
 
