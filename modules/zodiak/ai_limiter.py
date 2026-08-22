@@ -1,55 +1,82 @@
 import os
-import json
-import sqlite3
 import hashlib
 from datetime import date
 from flask import request
 
+try:
+    import pymysql
+    import pymysql.cursors
+    HAS_PYMYSQL = True
+except ImportError:
+    HAS_PYMYSQL = False
+
 DAILY_AI_LIMIT = 2
 
-# Database path with tmp fallback for serverless
-PRIMARY_DB_FILE = os.path.join(os.path.dirname(__file__), 'ai_quota.db')
-TMP_DB_FILE = '/tmp/ai_quota.db' if os.name != 'nt' else os.path.join(os.environ.get('TEMP', '.'), 'ai_quota_tmp.db')
+# Config MySQL (dari .env atau default credentials)
+MYSQL_HOST = os.environ.get('MYSQL_HOST', '194.233.65.45')
+MYSQL_PORT = int(os.environ.get('MYSQL_PORT', 3306))
+MYSQL_DB = os.environ.get('MYSQL_DB', 'uj7e3mhs_peace_orc')
+MYSQL_USER = os.environ.get('MYSQL_USER', 'uj7e3mhs_db_peace_orc')
+MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', 'peaceorc986')
 
 _MEMORY_STORE = {}
 
-def _get_db_path():
-    try:
-        conn = sqlite3.connect(PRIMARY_DB_FILE)
-        conn.close()
-        return PRIMARY_DB_FILE
-    except Exception:
-        return TMP_DB_FILE
-
-def _get_db_connection():
-    db_path = _get_db_path()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _get_mysql_connection():
+    if not HAS_PYMYSQL:
+        return None
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DB,
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=2,
+        read_timeout=3,
+        write_timeout=3,
+        autocommit=True
+    )
 
 def init_db():
     try:
-        conn = _get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ai_quota (
-                client_id TEXT PRIMARY KEY,
-                quota_date TEXT NOT NULL,
-                used_count INTEGER NOT NULL DEFAULT 0
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        conn = _get_mysql_connection()
+        if conn:
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS ai_quota (
+                        client_id VARCHAR(191) PRIMARY KEY,
+                        quota_date VARCHAR(20) NOT NULL,
+                        used_count INT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_quota_date (quota_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                ''')
+            conn.close()
     except Exception:
         pass
 
-# Initialize DB table on import
+# Initialize DB safely
 init_db()
+
+def get_ip_id():
+    """
+    Menghasilkan Hash berbasis Alamat IP Klien.
+    Proteksi super strict agar pengguna tidak bisa bypass walau hapus localStorage/Cookies/Incognito.
+    """
+    try:
+        forwarded = request.headers.get('X-Forwarded-For')
+        if forwarded:
+            ip = forwarded.split(',')[0].strip()
+        else:
+            ip = request.remote_addr or '127.0.0.1'
+        return f"ip_{hashlib.md5(ip.encode('utf-8')).hexdigest()}"
+    except Exception:
+        return "ip_default"
 
 def get_fp_id():
     """
     Menghasilkan Fingerprint Hash berbasis IP + User-Agent.
-    Dipakai sebagai fallback & proteksi ganda jika cookie/localstorage dibersihkan.
+    Dipakai sebagai proteksi ganda jika browser berganti tab/UA.
     """
     try:
         forwarded = request.headers.get('X-Forwarded-For')
@@ -71,8 +98,6 @@ def get_client_id():
     2. Cookie _z_device_id
     3. Parameter JSON device_id
     4. Fallback: Hash IP + User-Agent
-
-    Catatan: Menggunakan format konsisten 'device_<raw_id>' untuk mencegah bypass kuota saat berpindah antar menu/endpoint.
     """
     try:
         raw_id = None
@@ -102,105 +127,122 @@ def get_client_id():
     except Exception:
         return get_fp_id()
 
-def _db_get_count(client_id, today_str):
+def _db_get_batch_count(keys_list, today_str):
     global _MEMORY_STORE
-    db_count = 0
+    unique_keys = [k for k in set(keys_list) if k]
+    if not unique_keys:
+        return 0
+
+    max_count = 0
     try:
-        conn = _get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT used_count FROM ai_quota WHERE client_id = ? AND quota_date = ?",
-            (client_id, today_str)
-        )
-        row = cursor.fetchone()
-        if row:
-            db_count = row['used_count']
-        conn.close()
+        conn = _get_mysql_connection()
+        if conn:
+            with conn.cursor() as cursor:
+                format_strings = ','.join(['%s'] * len(unique_keys))
+                query = f"SELECT used_count FROM ai_quota WHERE quota_date = %s AND client_id IN ({format_strings})"
+                cursor.execute(query, [today_str] + unique_keys)
+                rows = cursor.fetchall()
+                for r in rows:
+                    max_count = max(max_count, r['used_count'])
+            conn.close()
     except Exception:
         pass
 
-    mem_val = _MEMORY_STORE.get(client_id, {})
-    mem_count = mem_val.get('count', 0) if mem_val.get('date') == today_str else 0
+    for k in unique_keys:
+        mem_val = _MEMORY_STORE.get(k, {})
+        if mem_val.get('date') == today_str:
+            max_count = max(max_count, mem_val.get('count', 0))
 
-    return max(db_count, mem_count)
+    return max_count
 
-def _db_set_count(client_id, today_str, count):
+def _db_set_batch_count(keys_list, today_str, count):
     global _MEMORY_STORE
-    _MEMORY_STORE[client_id] = {'date': today_str, 'count': count}
+    unique_keys = [k for k in set(keys_list) if k]
+    if not unique_keys:
+        return
+
+    for k in unique_keys:
+        _MEMORY_STORE[k] = {'date': today_str, 'count': count}
+
     try:
-        conn = _get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO ai_quota (client_id, quota_date, used_count)
-            VALUES (?, ?, ?)
-            ON CONFLICT(client_id) DO UPDATE SET
-                quota_date = excluded.quota_date,
-                used_count = excluded.used_count
-        ''', (client_id, today_str, count))
-        conn.commit()
-        conn.close()
+        conn = _get_mysql_connection()
+        if conn:
+            with conn.cursor() as cursor:
+                records = [(k, today_str, count) for k in unique_keys]
+                cursor.executemany('''
+                    INSERT INTO ai_quota (client_id, quota_date, used_count)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        quota_date = VALUES(quota_date),
+                        used_count = VALUES(used_count)
+                ''', records)
+            conn.close()
     except Exception:
         pass
 
 def check_ai_quota(client_id=None):
     """
-    Memeriksa kuota AI harian pengguna (Maksimal 2x / hari) via SQLite DB.
-    Strict Check: Memeriksa Device ID DAN IP+UserAgent Fingerprint.
-    Kembalikan (is_allowed, count, limit, notice_message)
+    ULTRA-STRICT AI RATE LIMITER:
+    Memeriksa kuota AI harian pengguna (Maksimal persis 2x / hari) via Database MySQL.
+    Menggabungkan Device UUID + Alamat IP + Fingerprint Hash.
+    Anti-Bypass: Tidak bisa diakali walau hapus localStorage, clear cookie, incognito, atau pindah menu.
     """
-    if not client_id:
-        client_id = get_client_id()
+    try:
+        if not client_id:
+            client_id = get_client_id()
 
-    today_str = date.today().isoformat()
-    init_db()
+        today_str = date.today().isoformat()
 
-    count = _db_get_count(client_id, today_str)
+        ip_id = get_ip_id()
+        fp_id = get_fp_id()
 
-    legacy_max = 0
-    if client_id.startswith('device_'):
-        raw = client_id[7:]
-        for pfx in ('dev_', 'cookie_', 'json_'):
-            leg_count = _db_get_count(f"{pfx}{raw}", today_str)
-            legacy_max = max(legacy_max, leg_count)
+        keys_to_check = [client_id, ip_id, fp_id]
+        if client_id.startswith('device_'):
+            raw = client_id[7:]
+            keys_to_check.extend([f"dev_{raw}", f"cookie_{raw}", f"json_{raw}"])
 
-    fp_id = get_fp_id()
-    fp_count = 0
-    if fp_id and fp_id != client_id:
-        fp_count = _db_get_count(fp_id, today_str)
+        effective_count = _db_get_batch_count(keys_to_check, today_str)
 
-    effective_count = max(count, legacy_max, fp_count)
+        if effective_count >= DAILY_AI_LIMIT:
+            notice = f"Kuota mode AI harian Anda telah habis (Maksimal {DAILY_AI_LIMIT}x per hari). Beralih ke Data Prediksi Statis."
+            return False, effective_count, DAILY_AI_LIMIT, notice
 
-    if effective_count >= DAILY_AI_LIMIT:
-        notice = "AI quota mode limited. Switching to Static Data Prediction."
-        return False, effective_count, DAILY_AI_LIMIT, notice
-
-    return True, effective_count, DAILY_AI_LIMIT, None
+        return True, effective_count, DAILY_AI_LIMIT, None
+    except Exception:
+        # Emergency Fallback: Jangan pernah menggagalkan aplikasi jika terjadi error tak terduga
+        return True, 0, DAILY_AI_LIMIT, None
 
 def increment_ai_quota(client_id=None):
     """
-    Menambah hitungan penggunaan AI harian pengguna secara strict pada Device ID & IP Fingerprint via SQLite DB.
+    Menambah hitungan penggunaan AI harian pengguna secara ULTRA-STRICT pada Device UUID, IP Address, dan Fingerprint.
     """
-    if not client_id:
-        client_id = get_client_id()
+    try:
+        if not client_id:
+            client_id = get_client_id()
 
-    today_str = date.today().isoformat()
-    init_db()
+        today_str = date.today().isoformat()
 
-    is_allowed, current_count, limit, notice = check_ai_quota(client_id)
-    new_count = current_count + 1
+        is_allowed, current_count, limit, notice = check_ai_quota(client_id)
+        new_count = current_count + 1
 
-    _db_set_count(client_id, today_str, new_count)
+        ip_id = get_ip_id()
+        fp_id = get_fp_id()
 
-    if client_id.startswith('device_'):
-        raw = client_id[7:]
-        for pfx in ('dev_', 'cookie_', 'json_'):
-            _db_set_count(f"{pfx}{raw}", today_str, new_count)
+        keys_to_update = [client_id, ip_id, fp_id]
+        if client_id.startswith('device_'):
+            raw = client_id[7:]
+            keys_to_update.extend([f"dev_{raw}", f"cookie_{raw}", f"json_{raw}"])
 
-    fp_id = get_fp_id()
-    if fp_id and fp_id != client_id:
-        _db_set_count(fp_id, today_str, new_count)
+        _db_set_batch_count(keys_to_update, today_str, new_count)
 
-    return new_count
+        return new_count
+    except Exception:
+        return 1
+
+
+
+
+
 
 
 
